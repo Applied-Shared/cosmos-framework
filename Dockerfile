@@ -37,7 +37,7 @@ RUN --mount=type=cache,target=/var/cache/apt \
 
 # Install uv: https://docs.astral.sh/uv/getting-started/installation/
 # https://github.com/astral-sh/uv-docker-example/blob/main/Dockerfile
-COPY --from=ghcr.io/astral-sh/uv:0.8.12 /uv /uvx /usr/local/bin/
+COPY --from=ghcr.io/astral-sh/uv:0.11.28 /uv /uvx /usr/local/bin/
 # Copy from the cache instead of linking since it's a mounted volume
 ENV UV_LINK_MODE=copy
 # Ensure installed tools can be executed out of the box
@@ -59,7 +59,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
     --mount=type=bind,source=packages,target=packages \
     echo "${PYTHON_VERSION}" > .python-version && \
-    uv sync --locked --no-install-project --extra=${CUDA_NAME}
+    uv sync --locked --no-install-project --group=${CUDA_NAME}
 
 # Copy the code into the container if in standalone mode. Otherwise, just install the dependencies at runtime.
 # We mount the source code to /tmp and copy it to /workspace if in standalone mode.
