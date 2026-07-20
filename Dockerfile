@@ -49,9 +49,10 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | bash 
 WORKDIR /workspace
 
 # Install the project's dependencies using the lockfile and settings.
-# Host .python-version may be 3.13 (cu130 local dev), but Lilypad needs 3.10 for
-# cu128 flash-attn wheels and ray[default]==2.50.1.7.
-ARG PYTHON_VERSION=3.10
+# Python 3.13 matches upstream cosmos-framework's .python-version. The cu128
+# dependency group ships cp313-only wheels (flash-attn 2.7.4.post1+cu128.torch210
+# from nvidia-cosmos.github.io/cosmos-dependencies), so 3.10 fails at uv sync.
+ARG PYTHON_VERSION=3.13
 ARG CUDA_NAME=cu128
 ENV CUDA_NAME=${CUDA_NAME}
 RUN --mount=type=cache,target=/root/.cache/uv \
