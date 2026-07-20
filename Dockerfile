@@ -75,17 +75,22 @@ RUN --mount=type=bind,source=.,target=/tmp/workspace \
 # Place executables in the environment at the front of the path
 ENV PATH="/workspace/.venv/bin:$PATH"
 
-# Install Ray for Lilypad workload orchestration. Ray is not in uv.lock (it's Applied-internal),
-# so we install it separately. The entrypoint uses --inexact to prevent uv sync from pruning it.
-RUN uv pip install "ray[default]==2.50.1.7" --extra-index-url https://ursa.pypi.applied.dev/simple
+# Install Ray for Lilypad workload orchestration. cosmos-framework's uv.lock
+# already brings ray==2.46.0, but Applied's Lilypad protocol needs 2.50.x.
+# Applied's index only publishes cp310-cp312 wheels for ray 2.50.1.7, so we
+# also allow public pypi via --index-strategy unsafe-best-match. Public pypi
+# has cp313 wheels for 2.50.x, and we still prefer Applied's index when it
+# has a compatible version.
+RUN uv pip install "ray[default]==2.50.1.7" \
+    --extra-index-url https://ursa.pypi.applied.dev/simple \
+    --index-strategy unsafe-best-match
 
-# click 8.3.x _Sentinel enum uses object() values that fail Python 3.10's deepcopy identity
-# reconstruction; Ray's add_command_alias calls copy.deepcopy() at import time and crashes.
-# Downgrade to 8.2.x which has proper __deepcopy__ support.
-RUN uv pip install "click==8.2.1"
+# click 8.3.x _Sentinel deepcopy bug is Python-3.10-only; on 3.13 no pin needed.
 
 # Install Lilypad SDK for cross-region boto caching utilities.
-RUN uv pip install "lilypad-py==2.27.0" --extra-index-url https://ursa.pypi.applied.dev/simple
+RUN uv pip install "lilypad-py==2.27.0" \
+    --extra-index-url https://ursa.pypi.applied.dev/simple \
+    --index-strategy unsafe-best-match
 
 # Skip uv sync at container start — all deps are already installed above (STANDALONE=true bakes
 # everything in at build time). This prevents uv sync from downgrading click and breaking Ray.
