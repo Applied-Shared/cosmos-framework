@@ -64,9 +64,13 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 # Copy the code into the container if in standalone mode. Otherwise, just install the dependencies at runtime.
 # We mount the source code to /tmp and copy it to /workspace if in standalone mode.
+# Direct uv sync (not `just install ${CUDA_NAME}`) — cosmos-framework's install
+# recipe forwards its args as `--reinstall <arg>` to uv, which uv rejects. This
+# call installs the project itself plus all extras + the cuda group (matches
+# upstream cosmos-framework's Dockerfile pattern, minus vllm).
 ARG STANDALONE
 RUN --mount=type=bind,source=.,target=/tmp/workspace \
-   if [ "$STANDALONE" = "true" ] ; then cp -r /tmp/workspace/* /workspace && echo "${PYTHON_VERSION}" > /workspace/.python-version && just install ${CUDA_NAME} && rm -rf /workspace/.git ; else echo "Run just install to install all the dependencies at runtime" ; fi
+   if [ "$STANDALONE" = "true" ] ; then cp -r /tmp/workspace/* /workspace && echo "${PYTHON_VERSION}" > /workspace/.python-version && uv sync --locked --no-editable --all-extras --group=${CUDA_NAME} && rm -rf /workspace/.git ; else echo "Run uv sync to install all the dependencies at runtime" ; fi
 
 # Place executables in the environment at the front of the path
 ENV PATH="/workspace/.venv/bin:$PATH"
