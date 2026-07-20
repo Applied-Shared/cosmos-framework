@@ -82,10 +82,14 @@ ENV PATH="/workspace/.venv/bin:$PATH"
 # at workload submission time and revisit (options: Applied publishes cp313
 # wheels for 2.50+, or use a public-pypi ray 2.50.x with cp313 wheels).
 
-# Install Lilypad SDK for cross-region boto caching utilities.
-RUN uv pip install "lilypad-py==2.27.0" \
+# Lilypad SDK is best-effort — provides an AIStore-cached boto client for
+# faster cross-region GETs. Applied's index has no cp313 wheels for
+# lilypad-py as of 2026-07-20; the entrypoint falls back to plain boto3
+# when the import fails. When cp313 wheels get published, drop `|| true`.
+RUN uv pip install "lilypad-py" \
     --extra-index-url https://ursa.pypi.applied.dev/simple \
-    --index-strategy unsafe-best-match
+    --index-strategy unsafe-best-match || \
+    echo "lilypad-py install skipped (no cp313 wheel available)"
 
 # Skip uv sync at container start — all deps are already installed above (STANDALONE=true bakes
 # everything in at build time). This prevents uv sync from downgrading click and breaking Ray.

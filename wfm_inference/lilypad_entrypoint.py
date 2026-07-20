@@ -24,9 +24,19 @@ from pathlib import Path
 import boto3
 import botocore.config
 import ray
-from lilypad.public.sdk_py.cached_file_access.boto import get_readonly_boto_client
 
 logger = logging.getLogger(__name__)
+
+# Lilypad SDK provides an AIStore-cached read-only boto client that
+# accelerates cross-region GETs (e.g. Phoenix → Chicago cache). If the SDK
+# isn't available (no cp313 wheel published as of 2026-07-20), fall back to
+# plain boto3 — correct but slower on the HF-cache preload path.
+try:
+    from lilypad.public.sdk_py.cached_file_access.boto import (
+        get_readonly_boto_client as _cached_client_factory,
+    )
+except ImportError:
+    _cached_client_factory = None
 
 # OCI S3-compat requires payload signing and disables the default AWS SDK v4
 # checksum headers that OCI doesn't support.
@@ -152,7 +162,13 @@ def _run_batch_on_gpu(base_config: dict, jobs: list[dict]) -> None:
 
     import boto3
     import botocore.config
-    from lilypad.public.sdk_py.cached_file_access.boto import get_readonly_boto_client
+
+    try:
+        from lilypad.public.sdk_py.cached_file_access.boto import (
+            get_readonly_boto_client,
+        )
+    except ImportError:
+        get_readonly_boto_client = None
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     logger = logging.getLogger(__name__)
@@ -170,7 +186,13 @@ def _run_batch_on_gpu(base_config: dict, jobs: list[dict]) -> None:
         aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
         config=_oci_config,
     )
-    cached_client = get_readonly_boto_client()
+    if get_readonly_boto_client is not None:
+        cached_client = get_readonly_boto_client()
+    else:
+        logger.warning(
+            "lilypad SDK not installed; falling back to plain boto3 client for HF cache downloads"
+        )
+        cached_client = plain_client
 
     hf_cache_dir = Path(os.environ.get("HF_HUB_CACHE", Path.home() / ".cache" / "huggingface" / "hub"))
 
