@@ -75,17 +75,12 @@ RUN --mount=type=bind,source=.,target=/tmp/workspace \
 # Place executables in the environment at the front of the path
 ENV PATH="/workspace/.venv/bin:$PATH"
 
-# Install Ray for Lilypad workload orchestration. cosmos-framework's uv.lock
-# already brings ray==2.46.0, but Applied's Lilypad protocol needs 2.50.x.
-# Applied's index only publishes cp310-cp312 wheels for ray 2.50.1.7, so we
-# also allow public pypi via --index-strategy unsafe-best-match. Public pypi
-# has cp313 wheels for 2.50.x, and we still prefer Applied's index when it
-# has a compatible version.
-RUN uv pip install "ray[default]==2.50.1.7" \
-    --extra-index-url https://ursa.pypi.applied.dev/simple \
-    --index-strategy unsafe-best-match
-
-# click 8.3.x _Sentinel deepcopy bug is Python-3.10-only; on 3.13 no pin needed.
+# Ray: cosmos-framework's uv.lock already installs ray==2.46.0 (cp313 wheels).
+# The 2.5 Dockerfile force-upgraded to Applied's ray==2.50.1.7 but that version
+# has no cp313 wheels on any index we've tried. Sticking with the framework's
+# 2.46 for now; if Lilypad's runtime protocol requires 2.50+, we'll see that
+# at workload submission time and revisit (options: Applied publishes cp313
+# wheels for 2.50+, or use a public-pypi ray 2.50.x with cp313 wheels).
 
 # Install Lilypad SDK for cross-region boto caching utilities.
 RUN uv pip install "lilypad-py==2.27.0" \
