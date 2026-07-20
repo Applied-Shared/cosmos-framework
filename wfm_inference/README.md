@@ -1,19 +1,21 @@
 # WFM Inference — Lilypad Entrypoint
 
-Runs Cosmos Transfer 2.5 multiview inference on Lilypad generic workloads.
-The workload config lives at `adp/services/wfm/lilypad_workload_configs/cosmos_transfer_inference.yaml`
-in the applied3 repo.
+Runs Cosmos 3 Transfer inference on Lilypad generic workloads. The applied3
+workload config lives at
+`adp/services/wfm/lilypad_workload_configs/cosmos_transfer3_inference.yaml`.
 
 ## Architecture
 
 Lilypad generic workloads start a Ray cluster with two node types:
 
 - **Head node** (`InstanceTypeVMStandardE5Flex`, CPU-only) — runs `lilypad_entrypoint.run()`.
-- **GPU worker nodes** (A100×8) — where all the heavy work actually happens.
+- **GPU worker nodes** — where all the heavy work happens. Default is 1 GPU
+  (Cosmos3-Nano fits on a single A100/H100); set `num_gpus > 1` to use `torchrun`
+  and drive Cosmos3-Super across multiple GPUs.
 
-`run()` calls `_run_inference_on_gpu.remote(config)` and blocks on `ray.get()`. All
-download, inference, and upload logic lives inside the `@ray.remote` function so it
-executes on a GPU worker, not the CPU head.
+`run()` calls `_run_batch_on_gpu.remote(base_config, jobs)` and blocks on
+`ray.get()`. All download, inference, and upload logic lives inside the
+`@ray.remote` function so it executes on a GPU worker, not the CPU head.
 
 ## Usage
 
@@ -22,12 +24,12 @@ Export OCI credentials, then launch:
 ```bash
 export AWS_ACCESS_KEY_ID=<oci-access-key>
 export AWS_SECRET_ACCESS_KEY=<oci-secret-key>
-lilypad workload launch adp/services/wfm/lilypad_workload_configs/cosmos_transfer_inference.yaml
+lilypad workload launch adp/services/wfm/lilypad_workload_configs/cosmos_transfer3_inference.yaml
 ```
 
-The workload config contains a base `entrypoint_fn_config` that the WFM gRPC service
-will override per-job at submission time. For manual test runs the defaults point at
-`sensor-sim-wfm/inputs/multiview_example`.
+The workload config contains a base `entrypoint_fn_config` that the WFM gRPC
+service will override per-job at submission time. For manual test runs the
+defaults point at `sensor-sim-wfm/robotics/episodes/example_episode`.
 
 ## Config Keys
 
@@ -35,77 +37,113 @@ Shared fields (top-level, same for every job in the batch):
 
 | Key | Description |
 |-----|-------------|
-| `checkpoint_bucket` / `checkpoint_key` | OCI path to `model_ema_bf16.pt` — downloaded once |
-| `hf_cache_bucket` / `hf_cache_prefix` | OCI prefix holding the pre-staged HuggingFace model cache — downloaded once |
-| `experiment` | `--experiment` arg passed to `examples.multiview` |
-| `num_gpus` | GPUs to claim on the worker (default: 8) |
+| `hf_cache_bucket` / `hf_cache_prefix` | OCI prefix holding the pre-staged HuggingFace model cache |
+| `hf_snapshots` | List of `{repo, revision}` naming every HF snapshot the framework loads. Must be present under `hf_cache_prefix`. |
+| `checkpoint_path` | HF alias passed to `--checkpoint-path` (default: `Cosmos3-Nano`). Resolved by the framework registry at `cosmos_framework/inference/args.py:1144`. |
+| `parallelism_preset` | `--parallelism-preset` value (default: `latency`) |
+| `seed` | `--seed` value (default: `2026`) |
+| `num_gpus` | GPUs to claim on the worker. `1` → plain `python`; `>1` → `torchrun --nproc-per-node=N` |
 
 Per-job fields (under `jobs` list, or at top level for a single job):
 
 | Key | Description |
 |-----|-------------|
-| `input_bucket` / `input_prefix` | OCI location of the input asset tree (spec JSON + camera frames) |
-| `output_bucket` / `output_prefix` | OCI destination for generated video files |
-| `spec_json` | Spec file path relative to the assets root (default: `multiview_spec.json`) |
+| `input_bucket` / `input_prefix` | OCI location of the input asset tree (`spec.json`, control videos, `prompt.json`, `negative_prompt.json`) |
+| `output_bucket` / `output_prefix` | OCI destination for the generated MP4 |
+| `spec_json` | Spec file path relative to the assets root (default: `spec.json`) |
+| `recipe_overrides` | Optional top-level dict merge applied to `spec_json` before inference. An inline `prompt` key replaces `prompt_path`. |
 
-### Batch example
+### Single-job example (Cosmos3-Nano, edge control)
 
 ```yaml
 entrypoint_fn_config:
-  checkpoint_bucket: sensor-sim-wfm
-  checkpoint_key: checkpoints/iter_10k/model_ema_bf16.pt
   hf_cache_bucket: sensor-sim-wfm
-  hf_cache_prefix: checkpoints/hf-cache
-  experiment: transfer2_auto_multiview_post_train_example
-  num_gpus: 8
-  jobs:
-    - input_bucket: sensor-sim-wfm
-      input_prefix: inputs/scene_001
-      output_bucket: sensor-sim-wfm
-      output_prefix: inferences/scene_001
-      spec_json: multiview_spec.json
-    - input_bucket: sensor-sim-wfm
-      input_prefix: inputs/scene_002
-      output_bucket: sensor-sim-wfm
-      output_prefix: inferences/scene_002
-      spec_json: multiview_spec.json
+  hf_cache_prefix: checkpoints/hf-cache-cosmos3
+  hf_snapshots:
+    - repo: nvidia/Cosmos3-Nano
+      revision: main
+  checkpoint_path: Cosmos3-Nano
+  parallelism_preset: latency
+  seed: 2026
+  num_gpus: 1
+  input_bucket: sensor-sim-wfm
+  input_prefix: robotics/episodes/pickup_drill_v3
+  output_bucket: sensor-sim-wfm
+  output_prefix: robotics/inferences/pickup_drill_v3
+  spec_json: spec.json
+  recipe_overrides:
+    resolution: "720"
+    aspect_ratio: "16,9"
+    num_frames: 121
+    fps: 30
+    guidance: 3.0
+    control_guidance: 1.5
 ```
 
-The checkpoint and HF cache are downloaded once; each job then downloads its own
-assets, runs torchrun, and uploads outputs before the next job starts. Omitting
-`jobs` and using a flat config still works (single-job backward-compatible format).
+The HF cache is downloaded once per batch; each job then downloads its own
+assets, runs inference, and uploads outputs before the next job starts.
+
+### Spec.json shape
+
+Cosmos 3 spec files follow the transfer cookbook at
+[`cookbooks/cosmos3/generator/transfer/`](../cookbooks/cosmos3/generator/transfer)
+in this repo. Minimal edge-control spec:
+
+```json
+{
+  "name": "transfer_edge",
+  "model_mode": "video2video",
+  "resolution": "720",
+  "aspect_ratio": "16,9",
+  "num_frames": 121,
+  "fps": 30,
+  "guidance": 3.0,
+  "control_guidance": 1.5,
+  "negative_prompt_file": "negative_prompt.json",
+  "prompt_path": "prompt.json",
+  "edge": {
+    "vision_path": "source.mp4",
+    "preset_edge_threshold": "medium"
+  }
+}
+```
+
+`vision_path` derives the Canny edge control on the fly. Use `control_path`
+instead when passing a pre-computed control video (required for `depth` and
+`seg` — those depend on DepthAnything and SAM2 which are not bundled).
 
 ## Building and Pushing the Docker Image
 
 All inference code is baked into the image at build time (`STANDALONE=true`).
 
 ```bash
-cd /home/yun/cosmos-transfer2.5
+cd <path to this repo checkout>
 docker build -f Dockerfile \
   --build-arg CUDA_NAME=cu128 \
   --build-arg STANDALONE=true \
-  -t us-phoenix-1.ocir.io/idskhu5vqvtl/lilypad/sds:cosmos_transfer2.5_v<VERSION> .
+  -t us-phoenix-1.ocir.io/idskhu5vqvtl/lilypad/sds:cosmos_transfer3_v<VERSION> .
 
-docker push us-phoenix-1.ocir.io/idskhu5vqvtl/lilypad/sds:cosmos_transfer2.5_v<VERSION>
+docker push us-phoenix-1.ocir.io/idskhu5vqvtl/lilypad/sds:cosmos_transfer3_v<VERSION>
 ```
 
-Make sure you've docker loged in, for example:
+Log in first if you haven't already:
+
 ```bash
-docker login us-phoenix-1.ocir.io -u idskhu5vqvtl/yun@applied.co
+docker login us-phoenix-1.ocir.io -u idskhu5vqvtl/<user>@applied.co
 ```
 
-Get an OCI auth token from OCI profile and paste it as the password when prompt.
+Paste an OCI auth token (not password) when prompted.
 
-
-Then update `docker_image` in `lilypad_workload_configs/cosmos_transfer_inference.yaml` to match.
-
-Most layers are shared with the previous tag, so rebuilds are fast (under a minute when
-only Python files changed).
+After push, bump `docker_image` in
+`adp/services/wfm/lilypad_workload_configs/cosmos_transfer3_inference.yaml`.
+Most layers are shared with previous tags, so rebuilds are fast when only
+Python files changed.
 
 ## OCI S3-compat Gotcha
 
-OCI's S3-compatible API requires payload signing and does not accept the default AWS SDK v4
-checksum headers. Any boto3 client used for PUT/LIST against OCI must use:
+OCI's S3-compatible API requires payload signing and does not accept the
+default AWS SDK v4 checksum headers. Any boto3 client used for PUT/LIST
+against OCI must use:
 
 ```python
 botocore.config.Config(
@@ -116,70 +154,64 @@ botocore.config.Config(
 ```
 
 There are two clients in the worker:
+
 - **`plain_client`** — direct OCI client (above config). Used for LIST, PUT, and
   downloads where AIStore caching is not desired.
-- **`cached_client`** (`get_readonly_boto_client()`) — routes GETs through the AIStore
-  cross-region cache at the Chicago edge. Used for checkpoint and HF cache downloads
+- **`cached_client`** (`get_readonly_boto_client()`) — routes GETs through the
+  AIStore cross-region cache at the Chicago edge. Used for HF cache downloads
   to avoid repeated cross-region transfer costs.
 
 ## Pre-staging the HuggingFace Model Cache
 
-The inference pipeline (`checkpoint_db.py`) downloads two auxiliary HF models at startup:
+Cosmos 3 resolves `--checkpoint-path Cosmos3-Nano` to HF repo
+[`nvidia/Cosmos3-Nano`](https://huggingface.co/nvidia/Cosmos3-Nano) via the
+registry at `cosmos_framework/inference/args.py:1144`. That repo ships its own
+processor/tokenizer, so no upstream `Qwen/Qwen3-VL-*-Instruct` side-download is
+needed — only **one** HF repo has to be pre-staged.
 
-| Model | HF repo | Revision expected by checkpoint_db |
-|-------|---------|-------------------------------------|
-| VAE tokenizer | `nvidia/Cosmos-Predict2.5-2B` | `6787e176dce74a101d922174a95dba29fa5f0c55` |
-| Text encoder | `nvidia/Cosmos-Reason1-7B` | `3210bec0495fdc7a8d3dbb8d58da5711eab4b423` |
-
-To avoid requiring `HF_TOKEN` at runtime, these are pre-staged in OCI under
-`sensor-sim-wfm/checkpoints/hf-cache/` as a standard HF hub cache tree:
+Pre-stage the cache in OCI under `sensor-sim-wfm/checkpoints/hf-cache-cosmos3/`
+as a standard HF hub cache tree:
 
 ```
-models--nvidia--Cosmos-Predict2.5-2B/
-  refs/main
-  snapshots/<rev>/tokenizer.pth
-  blobs/...
-
-models--nvidia--Cosmos-Reason1-7B/
+models--nvidia--Cosmos3-Nano/
   refs/main
   snapshots/<rev>/<all model files>
   blobs/...
 ```
 
-Upload with `aws s3 sync` pointed at `~/.cache/huggingface/hub/` after downloading the
-models locally. Requires these env var overrides to fix OCI upload errors:
+Upload with `aws s3 sync` pointed at `~/.cache/huggingface/hub/` after
+downloading the model locally. OCI upload needs the same checksum overrides:
 
 ```bash
 export AWS_REQUEST_CHECKSUM_CALCULATION=when_required
 export AWS_RESPONSE_CHECKSUM_VALIDATION=when_required
 aws s3 sync ~/.cache/huggingface/hub/ \
-  s3://sensor-sim-wfm/checkpoints/hf-cache/ \
+  s3://sensor-sim-wfm/checkpoints/hf-cache-cosmos3/ \
   --endpoint-url https://idskhu5vqvtl.compat.objectstorage.us-phoenix-1.oraclecloud.com
 ```
 
-### Revision mismatch fix
+Note the `hf-cache-cosmos3` prefix — kept separate from the 2.5 `hf-cache/`
+prefix so the two model families don't collide.
 
-`checkpoint_db.py` hardcodes specific git revisions. When those revisions were staged,
-the HF repo `main` branch pointed at a different commit, so the OCI cache contains
-snapshots at the wrong revision paths.
+### Revision handling
 
-`_remap_hf_snapshot()` handles this after download: it reads `refs/main` from the local
-cache, copies `snapshots/<actual>/` to `snapshots/<expected>/` if they differ, then sets
-`HF_HUB_OFFLINE=1`. From that point, `uvx hf download --revision <expected>` finds the
-files locally and never contacts HuggingFace.
-
-If `checkpoint_db.py` is updated to a new revision, update the `expected_revision`
-arguments in `_remap_hf_snapshot` calls and re-stage the OCI cache if the model weights
-actually changed.
+The workload YAML's `hf_snapshots` list names the revision each repo is
+expected to load. Cosmos 3's built-in registry uses `revision: main` (a
+floating ref) for `Cosmos3-Nano`, so `_remap_hf_snapshot()` aliases whatever
+commit was staged to the `main`-resolved revision on the worker. If the
+framework's registry is later pinned to a specific commit, update the
+`revision` field in the workload YAML to match and re-stage the OCI cache if
+the model weights actually changed.
 
 ## Content Safety Guardrails
 
-`examples.multiview` enables guardrails by default, which would download
-`nvidia/Cosmos-Guardrail1` (~7B LLaMA-based safety model) from HuggingFace at startup.
-That model is not staged in OCI and is not needed for internal inference on controlled
-driving data.
+Cosmos 3 enables guardrails by default, which would download
+[`nvidia/Cosmos-1.0-Guardrail`](https://huggingface.co/nvidia/Cosmos-1.0-Guardrail)
+(gated) from HuggingFace at startup. That model is not staged in OCI and is
+not needed for internal inference on controlled robotics data.
 
-Guardrails are disabled by passing `--disable-guardrails` to the torchrun command.
-If guardrail checks are ever needed, stage `nvidia/Cosmos-Guardrail1` at revision
-`d6d4bfa899a71454a700907664f3e88f503950cf` in OCI and remove that flag (and add a
-`_remap_hf_snapshot` call for it).
+Guardrails are disabled by passing `--no-guardrails` to
+`cosmos_framework.scripts.inference`. If guardrail checks are ever needed,
+request HF access to `nvidia/Cosmos-1.0-Guardrail`, stage it under
+`hf-cache-cosmos3/`, add an entry to the workload YAML's `hf_snapshots`, and
+remove `--no-guardrails` from the entrypoint.
