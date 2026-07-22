@@ -82,14 +82,20 @@ ENV PATH="/workspace/.venv/bin:$PATH"
 # at workload submission time and revisit (options: Applied publishes cp313
 # wheels for 2.50+, or use a public-pypi ray 2.50.x with cp313 wheels).
 
-# Lilypad SDK is best-effort — provides an AIStore-cached boto client for
-# faster cross-region GETs. Applied's index has no cp313 wheels for
-# lilypad-py as of 2026-07-20; the entrypoint falls back to plain boto3
-# when the import fails. When cp313 wheels get published, drop `|| true`.
-RUN uv pip install "lilypad-py" \
-    --extra-index-url https://ursa.pypi.applied.dev/simple \
-    --index-strategy unsafe-best-match || \
-    echo "lilypad-py install skipped (no cp313 wheel available)"
+# Lilypad SDK provides the `lilypad-ray-driver` console script that Lilypad's
+# ray-job controller invokes as the container entrypoint. Applied's ursa index
+# has no cp313 wheels for lilypad-py (only cp310/cp312), so we vendor a
+# pure-python wheel built from applied3 via
+#   bazel build //lilypad/public:lilypad_py_py312_pkg
+# and repacked with `python -m wheel tags --python-tag=py3 --abi-tag=none
+# --platform-tag=any`. lilypad-py is pure Python (proto stubs + click CLIs),
+# so cross-installing the cp312-built wheel on cp313 is safe. `--no-deps` is
+# required because the wheel's install_requires includes packages that either
+# aren't on cp313 or would fight with cosmos-framework's uv-locked env.
+# Smoke-time compromise; not a permanent solution — track cp313 support in
+# Applied's SDK build pipeline separately.
+COPY vendor/lilypad_py-0.0.1+dev-py3-none-any.whl /tmp/lilypad_py-0.0.1+dev-py3-none-any.whl
+RUN uv pip install --no-deps "/tmp/lilypad_py-0.0.1+dev-py3-none-any.whl"
 
 # Skip uv sync at container start — all deps are already installed above (STANDALONE=true bakes
 # everything in at build time). This prevents uv sync from downgrading click and breaking Ray.
