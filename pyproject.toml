@@ -343,11 +343,13 @@ ignore = [
 [tool.hatch.build.targets.sdist]
 packages = [
   "cosmos_framework",
+  "wfm_inference",
 ]
 
 [tool.hatch.build.targets.wheel]
 packages = [
   "cosmos_framework",
+  "wfm_inference",
 ]
 exclude = [
   "*_test.py",
