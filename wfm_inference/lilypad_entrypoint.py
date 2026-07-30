@@ -17,6 +17,7 @@ Ported from cosmos-transfer2.5. Key differences from 2.5:
 import json
 import logging
 import os
+import re
 import subprocess
 import tempfile
 from pathlib import Path
@@ -103,6 +104,25 @@ def _remap_hf_snapshot(
         logger.info("Remapped %s: %s -> %s", repo, actual_revision[:8], expected_revision[:8])
 
 
+_OCI_ENDPOINT_REGION_RE = re.compile(r"objectstorage\.[a-z0-9-]+\.oraclecloud\.com")
+
+
+def _endpoint_for_region(base_endpoint: str, region: str | None) -> str:
+    """Rewrite the OCI S3-compat endpoint FQDN to point at ``region``.
+
+    OCI S3-compatibility endpoints are per-region: buckets live inside a single
+    region's namespace and are not visible across regions. Given the base
+    endpoint (from ``AWS_ENDPOINT_URL_S3``) and a target region, swap the
+    ``objectstorage.<region>.oraclecloud.com`` segment. If ``region`` is None,
+    return the base endpoint unchanged.
+    """
+    if not region:
+        return base_endpoint
+    return _OCI_ENDPOINT_REGION_RE.sub(
+        f"objectstorage.{region}.oraclecloud.com", base_endpoint
+    )
+
+
 def _setup_hf_cache(
     plain_client: "boto3.client",
     cached_client: "boto3.client",
@@ -178,26 +198,48 @@ def _run_batch_on_gpu(base_config: dict, jobs: list[dict]) -> None:
         request_checksum_calculation="when_required",
         response_checksum_validation="when_required",
     )
-    plain_client = boto3.client(
-        "s3",
-        endpoint_url=os.environ["AWS_ENDPOINT_URL_S3"],
-        region_name=os.environ["AWS_DEFAULT_REGION"],
-        aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
-        aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
-        config=_oci_config,
-    )
+    _base_endpoint = os.environ["AWS_ENDPOINT_URL_S3"]
+    _default_region = os.environ["AWS_DEFAULT_REGION"]
+
+    _plain_clients: dict[str | None, "boto3.client"] = {}
+
+    def plain_client_for(region: str | None) -> "boto3.client":
+        """Return a cached boto3 S3 client whose endpoint targets ``region``.
+
+        ``region=None`` falls back to ``AWS_DEFAULT_REGION`` / ``AWS_ENDPOINT_URL_S3``
+        verbatim, preserving today's single-region behavior when nothing is set.
+        """
+        key = region or None
+        if key not in _plain_clients:
+            _plain_clients[key] = boto3.client(
+                "s3",
+                endpoint_url=_endpoint_for_region(_base_endpoint, region),
+                region_name=region or _default_region,
+                aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
+                aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
+                config=_oci_config,
+            )
+        return _plain_clients[key]
+
+    hf_cache_region = base_config.get("hf_cache_region")
+    hf_plain = plain_client_for(hf_cache_region)
     if get_readonly_boto_client is not None:
-        cached_client = get_readonly_boto_client()
+        try:
+            cached_client = get_readonly_boto_client(region_name=hf_cache_region) if hf_cache_region else get_readonly_boto_client()
+        except TypeError:
+            # Older SDK: no region_name kwarg. Fall back to argless call — HF cache
+            # download works but may be routed through the default region.
+            cached_client = get_readonly_boto_client()
     else:
         logger.warning(
             "lilypad SDK not installed; falling back to plain boto3 client for HF cache downloads"
         )
-        cached_client = plain_client
+        cached_client = hf_plain
 
     hf_cache_dir = Path(os.environ.get("HF_HUB_CACHE", Path.home() / ".cache" / "huggingface" / "hub"))
 
     _setup_hf_cache(
-        plain_client,
+        hf_plain,
         cached_client,
         base_config["hf_cache_bucket"],
         base_config["hf_cache_prefix"],
@@ -221,6 +263,8 @@ def _run_batch_on_gpu(base_config: dict, jobs: list[dict]) -> None:
         output_prefix = job["output_prefix"]
         spec_json = job.get("spec_json", "spec.json")
         recipe_overrides = job.get("recipe_overrides", {})
+        input_client = plain_client_for(job.get("input_region"))
+        output_client = plain_client_for(job.get("output_region"))
 
         logger.info("Job %d/%d: s3://%s/%s -> s3://%s/%s",
                     i + 1, len(jobs), input_bucket, input_prefix, output_bucket, output_prefix)
@@ -231,14 +275,14 @@ def _run_batch_on_gpu(base_config: dict, jobs: list[dict]) -> None:
             output_dir = work / "outputs"
             output_dir.mkdir(parents=True)
 
-            paginator = plain_client.get_paginator("list_objects_v2")
+            paginator = input_client.get_paginator("list_objects_v2")
             for page in paginator.paginate(Bucket=input_bucket, Prefix=input_prefix):
                 for obj in page.get("Contents", []):
                     key = obj["Key"]
                     relative = key[len(input_prefix):].lstrip("/")
                     dest = assets_dir / relative
                     dest.parent.mkdir(parents=True, exist_ok=True)
-                    plain_client.download_file(input_bucket, key, str(dest))
+                    input_client.download_file(input_bucket, key, str(dest))
 
             if recipe_overrides:
                 spec_path = assets_dir / spec_json
