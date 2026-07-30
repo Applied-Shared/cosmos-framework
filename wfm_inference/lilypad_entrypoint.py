@@ -257,17 +257,17 @@ def _run_batch_on_gpu(base_config: dict, jobs: list[dict]) -> None:
                 len(jobs), checkpoint_path, num_gpus)
 
     for i, job in enumerate(jobs):
-        input_bucket = job["input_bucket"]
-        input_prefix = job["input_prefix"]
+        control_bucket = job["control_bucket"]
+        control_prefix = job["control_prefix"]
         output_bucket = job["output_bucket"]
         output_prefix = job["output_prefix"]
         spec_json = job.get("spec_json", "spec.json")
         recipe_overrides = job.get("recipe_overrides", {})
-        input_client = plain_client_for(job.get("input_region"))
+        control_client = plain_client_for(job.get("control_region"))
         output_client = plain_client_for(job.get("output_region"))
 
         logger.info("Job %d/%d: s3://%s/%s -> s3://%s/%s",
-                    i + 1, len(jobs), input_bucket, input_prefix, output_bucket, output_prefix)
+                    i + 1, len(jobs), control_bucket, control_prefix, output_bucket, output_prefix)
 
         with tempfile.TemporaryDirectory() as tmpdir:
             work = Path(tmpdir)
@@ -275,14 +275,14 @@ def _run_batch_on_gpu(base_config: dict, jobs: list[dict]) -> None:
             output_dir = work / "outputs"
             output_dir.mkdir(parents=True)
 
-            paginator = input_client.get_paginator("list_objects_v2")
-            for page in paginator.paginate(Bucket=input_bucket, Prefix=input_prefix):
+            paginator = control_client.get_paginator("list_objects_v2")
+            for page in paginator.paginate(Bucket=control_bucket, Prefix=control_prefix):
                 for obj in page.get("Contents", []):
                     key = obj["Key"]
-                    relative = key[len(input_prefix):].lstrip("/")
+                    relative = key[len(control_prefix):].lstrip("/")
                     dest = assets_dir / relative
                     dest.parent.mkdir(parents=True, exist_ok=True)
-                    input_client.download_file(input_bucket, key, str(dest))
+                    control_client.download_file(control_bucket, key, str(dest))
 
             if recipe_overrides:
                 spec_path = assets_dir / spec_json
@@ -365,10 +365,15 @@ def run(config: dict) -> None:
         num_gpus:           GPUs to use; 1 -> python, >1 -> torchrun (default: 1)
 
     Per-job keys (under the jobs list, or at top level for a single job):
-        input_bucket:      OCI bucket containing input assets
-        input_prefix:      prefix under which the assets/ tree is stored
+        control_bucket:    OCI bucket containing the control-video bundle
+                           (Dana episode: edges/depth/segmentation mp4s + spec.json)
+        control_prefix:    prefix under which the control bundle is stored
+        control_region:    optional OCI region for control_bucket; when set,
+                           the boto3 client for input LIST/GET uses a region-
+                           swapped endpoint. Omit to reuse AWS_ENDPOINT_URL_S3.
         output_bucket:     OCI bucket to upload inference outputs to
         output_prefix:     prefix under which outputs will be written
+        output_region:     optional OCI region for output_bucket; see control_region.
         spec_json:         spec file path relative to assets root
                            (default: spec.json)
         recipe_overrides:  optional top-level merge into spec_json before inference
@@ -381,10 +386,10 @@ def run(config: dict) -> None:
         jobs = config["jobs"]
         base_config = {k: v for k, v in config.items() if k != "jobs"}
     else:
-        # Single-job flat format for backward compatibility.
+        # Single-job flat format for hand-authored launches.
         jobs = [{
-            "input_bucket": config["input_bucket"],
-            "input_prefix": config["input_prefix"],
+            "control_bucket": config["control_bucket"],
+            "control_prefix": config["control_prefix"],
             "output_bucket": config["output_bucket"],
             "output_prefix": config["output_prefix"],
             "spec_json": config.get("spec_json", "spec.json"),
