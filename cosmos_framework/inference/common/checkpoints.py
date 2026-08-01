@@ -1,9 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: OpenMDW-1.1
 
+import contextlib
 import functools
+import os
 import re
 import shutil
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from uuid import uuid4
 
@@ -64,6 +67,49 @@ def _avae_block_key_to_legacy(key: str, num_blocks: int) -> str:
     return key
 
 
+def _atomic_write(path: Path, write: Callable[[Path], None]) -> None:
+    """Produce ``path`` by writing a temp file in the same directory, then renaming.
+
+    ``torch.save`` streams its archive in place over several seconds, so a peer
+    process that tests ``path.exists()`` mid-write sees ``True`` and reads a
+    truncated archive (``PytorchStreamReader failed reading zip archive: failed
+    finding central directory``). Renaming within a directory is atomic on
+    POSIX, so the destination only ever becomes visible fully written and
+    ``exists()`` is a sound "is complete" signal.
+    """
+    tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+    try:
+        write(tmp)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+@contextlib.contextmanager
+def _materialization_lock(lock_path: Path) -> Iterator[None]:
+    """Serialize materialization across the local ranks of a torchrun job.
+
+    ``post_download`` hooks run on every rank and all local ranks share one
+    checkpoint cache directory, so without a lock each rank loads the same
+    multi-GB safetensors and rebuilds the same state dict at once. The lock is
+    advisory and best effort: if it cannot be taken (read-only or exotic
+    filesystem) we proceed anyway, since :func:`_atomic_write` is what
+    guarantees correctness — the lock only avoids the duplicated work.
+    """
+    import fcntl
+
+    try:
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+    except OSError:
+        yield
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
 def _materialize_avae_ckpt(local_dir: str) -> None:
     """Synthesize the legacy ``.ckpt`` + ``.json`` the native AVAE loader expects
     from the decoder-only ``sound_tokenizer/`` safetensors.
@@ -78,6 +124,9 @@ def _materialize_avae_ckpt(local_dir: str) -> None:
     We invert the forward conversion (key remap + snake reshape) and wrap the result
     under ``state_dict``. Native ``encoder.layers.*`` keys pass through
     ``_avae_block_key_to_legacy`` unchanged. Idempotent.
+
+    Safe to call concurrently from every rank of a torchrun job: the outputs are
+    published by atomic rename, and one rank at a time does the conversion.
     """
     import torch
     from safetensors.torch import load_file
@@ -85,38 +134,45 @@ def _materialize_avae_ckpt(local_dir: str) -> None:
     local = Path(local_dir)
     ckpt_path = local / _AVAE_LEGACY_CKPT_NAME
     json_path = local / _AVAE_LEGACY_JSON_NAME
+    # Sound because both files are published atomically: if they are visible at
+    # all, they are complete.
     if ckpt_path.exists() and json_path.exists():
         return
 
-    safetensors_path = local / "diffusion_pytorch_model.safetensors"
-    if not safetensors_path.exists():
-        safetensors_path = local / "model.safetensors"
-    config_path = local / "config.json"
-    if not safetensors_path.exists() or not config_path.exists():
-        raise FileNotFoundError(
-            f"AVAE shim: expected diffusion_pytorch_model.safetensors (or model.safetensors) "
-            f"and {config_path.name} in {local}"
-        )
+    with _materialization_lock(local / f".{_AVAE_LEGACY_CKPT_NAME}.lock"):
+        # A peer may have finished while we waited for the lock.
+        if ckpt_path.exists() and json_path.exists():
+            return
 
-    src = load_file(str(safetensors_path))
-    block_ids = {int(m.group(1)) for k in src if (m := re.fullmatch(r"decoder\.block\.(\d+)\..+", k))}
-    if not block_ids:
-        raise RuntimeError(f"No `decoder.block.*` keys in {safetensors_path}; cannot remap AVAE decoder.")
-    num_blocks = max(block_ids) + 1
+        safetensors_path = local / "diffusion_pytorch_model.safetensors"
+        if not safetensors_path.exists():
+            safetensors_path = local / "model.safetensors"
+        config_path = local / "config.json"
+        if not safetensors_path.exists() or not config_path.exists():
+            raise FileNotFoundError(
+                f"AVAE shim: expected diffusion_pytorch_model.safetensors (or model.safetensors) "
+                f"and {config_path.name} in {local}"
+            )
 
-    state_dict: dict = {}
-    for key, value in src.items():
-        legacy_key = _avae_block_key_to_legacy(key, num_blocks)
-        if (legacy_key.endswith(".alpha") or legacy_key.endswith(".beta")) and value.ndim == 3:
-            value = value.reshape(-1).contiguous()  # Snake1d [1, C, 1] -> [C]
-        state_dict[legacy_key] = value
-    if any(k.startswith("decoder.block.") for k in state_dict):
-        raise RuntimeError("`decoder.block.*` keys remain after AVAE remap; conversion is incomplete.")
+        src = load_file(str(safetensors_path))
+        block_ids = {int(m.group(1)) for k in src if (m := re.fullmatch(r"decoder\.block\.(\d+)\..+", k))}
+        if not block_ids:
+            raise RuntimeError(f"No `decoder.block.*` keys in {safetensors_path}; cannot remap AVAE decoder.")
+        num_blocks = max(block_ids) + 1
 
-    if not ckpt_path.exists():
-        torch.save({"state_dict": state_dict}, str(ckpt_path))
-    if not json_path.exists():
-        shutil.copyfile(str(config_path), str(json_path))
+        state_dict: dict = {}
+        for key, value in src.items():
+            legacy_key = _avae_block_key_to_legacy(key, num_blocks)
+            if (legacy_key.endswith(".alpha") or legacy_key.endswith(".beta")) and value.ndim == 3:
+                value = value.reshape(-1).contiguous()  # Snake1d [1, C, 1] -> [C]
+            state_dict[legacy_key] = value
+        if any(k.startswith("decoder.block.") for k in state_dict):
+            raise RuntimeError("`decoder.block.*` keys remain after AVAE remap; conversion is incomplete.")
+
+        if not ckpt_path.exists():
+            _atomic_write(ckpt_path, lambda p: torch.save({"state_dict": state_dict}, str(p)))
+        if not json_path.exists():
+            _atomic_write(json_path, lambda p: shutil.copyfile(str(config_path), str(p)))
 
 
 @functools.cache
