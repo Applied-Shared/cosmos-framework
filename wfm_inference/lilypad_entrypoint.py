@@ -323,7 +323,7 @@ def _run_batch_on_gpu(base_config: dict, jobs: list[dict]) -> None:
                 if console_log.exists():
                     debug_key = f"{output_prefix}/_debug/console.log"
                     try:
-                        plain_client.upload_file(str(console_log), output_bucket, debug_key)
+                        output_client.upload_file(str(console_log), output_bucket, debug_key)
                         logger.info("Uploaded console.log to s3://%s/%s", output_bucket, debug_key)
                     except Exception as upload_err:
                         logger.warning("Could not upload console.log: %s", upload_err)
@@ -335,9 +335,9 @@ def _run_batch_on_gpu(base_config: dict, jobs: list[dict]) -> None:
             logger.info("Uploading %d file(s) to s3://%s/%s", len(output_files), output_bucket, output_prefix)
             for path in output_files:
                 key = f"{output_prefix}/{path.relative_to(output_dir)}".lstrip("/")
-                plain_client.upload_file(str(path), output_bucket, key)
+                output_client.upload_file(str(path), output_bucket, key)
 
-            plain_client.put_object(
+            output_client.put_object(
                 Body=b"",
                 Bucket=output_bucket,
                 Key=f"{output_prefix}/succeed.txt",
@@ -387,13 +387,17 @@ def run(config: dict) -> None:
         base_config = {k: v for k, v in config.items() if k != "jobs"}
     else:
         # Single-job flat format for hand-authored launches.
-        jobs = [{
+        job = {
             "control_bucket": config["control_bucket"],
             "control_prefix": config["control_prefix"],
             "output_bucket": config["output_bucket"],
             "output_prefix": config["output_prefix"],
             "spec_json": config.get("spec_json", "spec.json"),
-        }]
+        }
+        for optional_key in ("control_region", "output_region", "recipe_overrides"):
+            if optional_key in config:
+                job[optional_key] = config[optional_key]
+        jobs = [job]
         base_config = config
 
     ray.init(address="auto")

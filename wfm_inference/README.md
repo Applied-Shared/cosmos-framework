@@ -38,6 +38,7 @@ Shared fields (top-level, same for every job in the batch):
 | Key | Description |
 |-----|-------------|
 | `hf_cache_bucket` / `hf_cache_prefix` | OCI prefix holding the pre-staged HuggingFace model cache |
+| `hf_cache_region` | Optional OCI region for `hf_cache_bucket`; swaps the boto3 endpoint when the cache lives outside `AWS_ENDPOINT_URL_S3` |
 | `hf_snapshots` | List of `{repo, revision}` naming every HF snapshot the framework loads. Must be present under `hf_cache_prefix`. |
 | `checkpoint_path` | HF alias passed to `--checkpoint-path` (default: `Cosmos3-Nano`). Resolved by the framework registry at `cosmos_framework/inference/args.py:1144`. |
 | `parallelism_preset` | `--parallelism-preset` value (default: `latency`) |
@@ -48,8 +49,10 @@ Per-job fields (under `jobs` list, or at top level for a single job):
 
 | Key | Description |
 |-----|-------------|
-| `input_bucket` / `input_prefix` | OCI location of the input asset tree (`spec.json`, control videos, `prompt.json`, `negative_prompt.json`) |
+| `control_bucket` / `control_prefix` | OCI location of the control bundle (`spec.json`, control videos, `prompt.json`, `negative_prompt.json`) |
+| `control_region` | Optional OCI region for `control_bucket`; swaps the boto3 endpoint for input LIST/GET |
 | `output_bucket` / `output_prefix` | OCI destination for the generated MP4 |
+| `output_region` | Optional OCI region for `output_bucket`; swaps the boto3 endpoint for output PUT |
 | `spec_json` | Spec file path relative to the assets root (default: `spec.json`) |
 | `recipe_overrides` | Optional top-level dict merge applied to `spec_json` before inference. An inline `prompt` key replaces `prompt_path`. |
 
@@ -66,8 +69,8 @@ entrypoint_fn_config:
   parallelism_preset: latency
   seed: 2026
   num_gpus: 1
-  input_bucket: sensor-sim-wfm
-  input_prefix: robotics/episodes/pickup_drill_v3
+  control_bucket: sensor-sim-wfm
+  control_prefix: robotics/episodes/pickup_drill_v3
   output_bucket: sensor-sim-wfm
   output_prefix: robotics/inferences/pickup_drill_v3
   spec_json: spec.json
@@ -153,10 +156,12 @@ botocore.config.Config(
 )
 ```
 
-There are two clients in the worker:
+There are two client factories in the worker:
 
-- **`plain_client`** — direct OCI client (above config). Used for LIST, PUT, and
-  downloads where AIStore caching is not desired.
+- **`plain_client_for(region)`** — returns a cached direct OCI boto3 client (above
+  config) whose endpoint targets `region`. Used for control-bundle LIST/GET,
+  output PUT, and HF-cache LIST. When `region` is omitted, the client uses
+  `AWS_ENDPOINT_URL_S3` / `AWS_DEFAULT_REGION`.
 - **`cached_client`** (`get_readonly_boto_client()`) — routes GETs through the
   AIStore cross-region cache at the Chicago edge. Used for HF cache downloads
   to avoid repeated cross-region transfer costs.
