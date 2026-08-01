@@ -52,6 +52,35 @@ _OCI_BOTO_CONFIG = botocore.config.Config(
 # up between jobs.
 _WORKER_CACHE_DIR = Path("/tmp/wfm_worker_cache")
 
+# Config keys that pin a parallelism axis explicitly, mapped to the inference
+# CLI flag each one drives.
+_PARALLELISM_AXES = {
+    "dp_shard_size": "--dp-shard-size",
+    "dp_replicate_size": "--dp-replicate-size",
+    "cp_size": "--cp-size",
+    "cfgp_size": "--cfgp-size",
+}
+
+
+def _parallelism_axis_flags(base_config: dict) -> list[str]:
+    """Build the explicit ``--{dp,cp,cfgp}-*-size`` flags, if any are configured.
+
+    The preset alone does not decide the whole topology. ``dp_shard_size``
+    defaults to the full world size regardless of preset, so a ``latency`` run
+    still shards weights across every rank and pays an FSDP all-gather per
+    layer. Pinning ``dp_shard_size: 1`` frees the ranks for the context- and
+    CFG-parallel axes that actually cut per-sample wall clock, and is what makes
+    ``latency`` behave as documented on multiple GPUs. It requires the model to
+    fit on one device.
+
+    Axes left unset stay on the preset's own defaults.
+    """
+    return [
+        f"{flag}={base_config[key]}"
+        for key, flag in _PARALLELISM_AXES.items()
+        if base_config.get(key) is not None
+    ]
+
 
 def _apply_recipe_overrides(spec: dict, recipe_overrides: dict) -> None:
     """Apply recipe overrides from the WFM InferenceRecipe onto a spec.json dict in-place.
@@ -252,6 +281,7 @@ def _run_batch_on_gpu(base_config: dict, jobs: list[dict]) -> None:
     num_gpus = base_config.get("num_gpus", 1)
     checkpoint_path = base_config.get("checkpoint_path", "Cosmos3-Nano")
     parallelism_preset = base_config.get("parallelism_preset", "latency")
+    parallelism_axes = _parallelism_axis_flags(base_config)
     seed = base_config.get("seed", 2026)
     logger.info("Shared resources ready; running %d job(s) with %s on %d GPU(s)",
                 len(jobs), checkpoint_path, num_gpus)
@@ -307,6 +337,7 @@ def _run_batch_on_gpu(base_config: dict, jobs: list[dict]) -> None:
 
             cmd += [
                 f"--parallelism-preset={parallelism_preset}",
+                *parallelism_axes,
                 "-i", str(assets_dir / spec_json),
                 "-o", str(output_dir),
                 "--checkpoint-path", checkpoint_path,
@@ -361,6 +392,15 @@ def run(config: dict) -> None:
         checkpoint_path:    HF model ID passed to --checkpoint-path
                             (default: "Cosmos3-Nano")
         parallelism_preset: --parallelism-preset value (default: "latency")
+        dp_shard_size:      optional --dp-shard-size. Ranks the model is
+                            FSDP-sharded over. Defaults to the world size, so on
+                            a single-sample job every rank all-gathers weights
+                            for a forward only one rank's sample needs. Set to 1
+                            (model permitting) so `latency` can spend the ranks
+                            on context/CFG parallelism instead.
+        dp_replicate_size:  optional --dp-replicate-size
+        cp_size:            optional --cp-size, context-parallel degree
+        cfgp_size:          optional --cfgp-size, CFG-parallel degree
         seed:               --seed value (default: 2026)
         num_gpus:           GPUs to use; 1 -> python, >1 -> torchrun (default: 1)
 
