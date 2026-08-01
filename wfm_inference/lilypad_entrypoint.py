@@ -387,13 +387,17 @@ def run(config: dict) -> None:
         base_config = {k: v for k, v in config.items() if k != "jobs"}
     else:
         # Single-job flat format for hand-authored launches.
-        jobs = [{
+        job = {
             "control_bucket": config["control_bucket"],
             "control_prefix": config["control_prefix"],
             "output_bucket": config["output_bucket"],
             "output_prefix": config["output_prefix"],
             "spec_json": config.get("spec_json", "spec.json"),
-        }]
+        }
+        for optional_key in ("control_region", "output_region", "recipe_overrides"):
+            if optional_key in config:
+                job[optional_key] = config[optional_key]
+        jobs = [job]
         base_config = config
 
     ray.init(address="auto")
