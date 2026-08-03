@@ -86,7 +86,11 @@ def _apply_recipe_overrides(spec: dict, recipe_overrides: dict) -> None:
     """Apply recipe overrides from the WFM InferenceRecipe onto a spec.json dict in-place.
 
     An inline ``prompt`` key replaces ``prompt_path``; every other key is applied
-    at the top level.
+    at the top level. ``max_frames`` defaults to ``num_frames`` when the latter
+    is set and the former is not, because transfer inference reads its output
+    length off the control video and clamps it only with ``max_frames`` -- a
+    caller who set ``num_frames`` almost always meant that to bound the output
+    too. Explicit ``max_frames`` still wins.
     """
     for key, value in recipe_overrides.items():
         if key == "prompt":
@@ -94,6 +98,8 @@ def _apply_recipe_overrides(spec: dict, recipe_overrides: dict) -> None:
             spec.pop("prompt_path", None)
         else:
             spec[key] = value
+    if "num_frames" in spec and "max_frames" not in spec:
+        spec["max_frames"] = spec["num_frames"]
 
 
 def _remap_hf_snapshot(
